@@ -47,6 +47,8 @@ const upload = multer({ storage });
 app.post("/upload", upload.single("file"), (req, res) => {
   if (req.file) {
     const filePath = req.file.path;
+    const user_id = req.body.user_id; // Get user_id from the request body
+    console.log("User ID:", user_id);
 
     // Read and parse the PDF
     fs.readFile(filePath, (err, data) => {
@@ -63,7 +65,7 @@ app.post("/upload", upload.single("file"), (req, res) => {
             return res.status(400).send("No text extracted from the PDF");
           }
 
-          main(extractedText);
+          main(extractedText,user_id);
           res.send(extractedText);
         })
         .catch((error) => {
@@ -76,8 +78,58 @@ app.post("/upload", upload.single("file"), (req, res) => {
   }
 });
 
+// Endpoint for user signup
+app.post("/signup", async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).send("Name, email, and password are required.");
+    }
+
+    // Check if the user already exists in the database
+    const { data: existingUser, error: fetchError } = await supabase
+      .from("users")
+      .select("*")
+      .eq("email", email)
+      .single();
+
+    if (fetchError && fetchError.code !== "PGRST116") {
+      console.error("Error fetching user from Supabase:", fetchError);
+      return res.status(500).send("Error checking user in the database.");
+    }
+
+    if (existingUser) {
+      if (existingUser.password !== password) {
+        console.log("Incorrect password for user:", email);
+        return res.status(400).json({ check: "falseP", message: "Incorrect password." });
+      }
+
+      console.log("User already exists and logged in successfully:", email);
+      return res.status(200).json({ check: "true", message: "User logged in successfully." ,data:existingUser });
+    }
+
+    // If the user does not exist, create a new user
+    const { data, error } = await supabase
+      .from("users")
+      .insert([{ name, email, password }])
+      .select(); // Use `.select()` to return the inserted data
+
+    if (error) {
+      console.error("Error storing user in Supabase:", error);
+      return res.status(500).send("Error storing user.");
+    }
+
+    console.log("User signed up successfully:", data);
+    return res.status(201).json({ check: "true", message: "User signed up successfully.", user: data[0] });
+  } catch (error) {
+    console.error("Error handling signup:", error);
+    return res.status(500).send("Internal server error.");
+  }
+});
+
 // Function to generate embeddings
-async function main(extractedText) {
+async function main(extractedText, user_id) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     const ai = new GoogleGenAI({ apiKey });
@@ -88,14 +140,14 @@ async function main(extractedText) {
     });
 
     const embedding = response.embeddings[0];
-    await storeEmbedding(extractedText, embedding);
+    await storeEmbedding(extractedText, embedding,user_id);
   } catch (error) {
     console.error("Error generating embeddings:", error);
   }
 }
 
 // Function to store embeddings in Supabase
-async function storeEmbedding(sentence, embedding) {
+async function storeEmbedding(sentence, embedding,user_id) {
   try {
     let embeddingArray = embedding.values;
 
@@ -114,6 +166,7 @@ async function storeEmbedding(sentence, embedding) {
       .from("documents")
       .insert([
         {
+          user_id:user_id,
           sentence: sentence,
           embedding: embeddingArray,
         },
@@ -130,19 +183,19 @@ async function storeEmbedding(sentence, embedding) {
 // Endpoint to handle user query
 app.post("/query", async (req, res) => {
   try {
-    const { query } = req.body;
-    console.log("Received query:", query);
-    
-    if (!query) {
-      return res.status(400).send("Query is required.");
+    const { query, user_id } = req.body; // Get query and user_id from the request body
+    console.log("Received query:", query, "for user_id:", user_id);
+
+    if (!query || !user_id) {
+      return res.status(400).send("Query and user ID are required.");
     }
 
     // Retrieve the closest matching document embeddings from Supabase
-    const embeddings = await getClosestEmbeddings(query);
+    const embeddings = await getClosestEmbeddings(query, user_id);
 
-    // if (!embeddings || embeddings.length === 0) {
-    //   return res.status(404).send("No matching documents found.");
-    // }
+    if (embeddings.error) {
+      return res.status(404).send(embeddings.error); // Send error message if no data is found
+    }
 
     // Use the embeddings in a query to the LLM (Google Gemini in this case)
     const aiResponse = await queryLLMWithEmbeddings(embeddings, query);
@@ -172,21 +225,25 @@ function calculateCosineSimilarity(queryEmbedding, documents) {
   }).filter((doc) => doc !== null).sort((a, b) => b.similarity - a.similarity);
 }
 
-async function getClosestEmbeddings(query) {
+async function getClosestEmbeddings(query, user_id) {
   try {
+    // Fetch embeddings for the specific user
     const { data, error } = await supabase
       .from("documents")
       .select("sentence, embedding")
+      .eq("user_id", user_id) // Filter by user_id
       .limit(5);
+      console.log(user_id);
+      
 
     if (error) {
       console.error("Error fetching data from Supabase:", error);
-      return [];
+      return { error: "Error fetching data from the database." };
     }
 
     if (!data || data.length === 0) {
-      console.log("No documents found in the database.");
-      return [];
+      console.log(`No documents found for user_id: ${user_id}`);
+      return { error: "No data found " };
     }
 
     // Parse embeddings from strings to arrays of numbers
@@ -203,11 +260,11 @@ async function getClosestEmbeddings(query) {
 
     // Get the embedding for the query
     const queryEmbedding = await getQueryEmbedding(query);
-    console.log("Query embedding:", queryEmbedding);
+    // console.log("Query embedding:", queryEmbedding);
 
     // Pass the parsed embeddings array to calculateCosineSimilarity
     const closestDocuments = calculateCosineSimilarity(queryEmbedding.values, embeddings);
-    console.log("Closest documents:", closestDocuments);
+    // console.log("Closest documents:", closestDocuments);
 
     // Return the original sentence along with similarity for the top matches
     return closestDocuments.map(doc => ({
@@ -216,7 +273,7 @@ async function getClosestEmbeddings(query) {
     }));
   } catch (error) {
     console.error("Error getting closest embeddings:", error);
-    return null;
+    return { error: "Error processing the request." };
   }
 }
 
